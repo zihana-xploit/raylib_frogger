@@ -61,8 +61,115 @@
 
 #define HIGH_SCORE_FILE "highscore.txt"
 
-/* how much faster obstacles get, per level */
-#define DIFFICULTY_STEP 0.15f
+/* how much faster obstacles get, per level - BASE values for MEDIUM
+   difficulty; actual values used at runtime are the g_* variables
+   below, which apply_difficulty() adjusts per difficulty mode. */
+#define BASE_DIFFICULTY_STEP 0.12f  /* vehicle speed increase per level */
+
+/* Level scaling constants (MEDIUM baseline) */
+#define BASE_VEHICLE_SPACING_SCALE 0.08f  /* spacing reduction per level */
+#define BASE_VEHICLE_MIN_SPACING 0.6f     /* min spacing multiplier (never below 60%) */
+#define BASE_LOG_SPACING_SCALE 0.1f       /* log gap increase per level */
+#define BASE_LOG_MAX_GAP 2.5f             /* max log gap multiplier */
+#define BASE_TIMER_SCALE 0.1f             /* timer reduction per level */
+#define BASE_TIMER_MIN_MULT 0.5f          /* min timer multiplier (never below 50%) */
+#define BASE_TIMER_DURATION 30.0f         /* seconds on the goal-row timer at level 1 */
+#define BASE_STARTING_LIVES 3
+
+
+/* ================================================================
+   SECTION: DIFFICULTY
+   Easy / Medium / Hard - adjusts how fast the level-to-level scaling
+   ramps up, the starting timer duration, and starting lives. Chosen
+   from the main menu (LEFT/RIGHT arrows) before pressing ENTER to
+   start; takes effect on the next new game.
+   ================================================================ */
+
+typedef enum Difficulty
+{
+    DIFF_EASY,
+    DIFF_MEDIUM,
+    DIFF_HARD
+} Difficulty;
+
+Difficulty currentDifficulty = DIFF_MEDIUM;
+
+/* Runtime scaling values - set by apply_difficulty(), read everywhere
+   the old #defines used to be read directly. */
+float g_difficultyStep;
+float g_vehicleSpacingScale;
+float g_vehicleMinSpacing;
+float g_logSpacingScale;
+float g_logMaxGap;
+float g_timerScale;
+float g_timerMinMult;
+float g_baseTimerDuration;
+int   g_startingLives;
+
+void apply_difficulty(Difficulty d)
+{
+    switch (d)
+    {
+        case DIFF_EASY:
+            g_difficultyStep      = BASE_DIFFICULTY_STEP * 0.6f;   /* obstacles speed up slower */
+            g_vehicleSpacingScale = BASE_VEHICLE_SPACING_SCALE * 0.6f;
+            g_vehicleMinSpacing   = 0.75f;                          /* never gets as crowded */
+            g_logSpacingScale     = BASE_LOG_SPACING_SCALE * 0.6f;
+            g_logMaxGap           = 2.0f;
+            g_timerScale          = BASE_TIMER_SCALE * 0.6f;
+            g_timerMinMult        = 0.7f;
+            g_baseTimerDuration   = 35.0f;                          /* more time per level */
+            g_startingLives       = 4;                              /* one extra life */
+            break;
+
+        case DIFF_HARD:
+            g_difficultyStep      = BASE_DIFFICULTY_STEP * 1.5f;   /* obstacles speed up faster */
+            g_vehicleSpacingScale = BASE_VEHICLE_SPACING_SCALE * 1.4f;
+            g_vehicleMinSpacing   = 0.45f;                          /* allowed to get much denser */
+            g_logSpacingScale     = BASE_LOG_SPACING_SCALE * 1.4f;
+            g_logMaxGap           = 3.2f;
+            g_timerScale          = BASE_TIMER_SCALE * 1.4f;
+            g_timerMinMult        = 0.35f;
+            g_baseTimerDuration   = 25.0f;                          /* less time per level */
+            g_startingLives       = 2;                              /* one fewer life */
+            break;
+
+        case DIFF_MEDIUM:
+        default:
+            g_difficultyStep      = BASE_DIFFICULTY_STEP;
+            g_vehicleSpacingScale = BASE_VEHICLE_SPACING_SCALE;
+            g_vehicleMinSpacing   = BASE_VEHICLE_MIN_SPACING;
+            g_logSpacingScale     = BASE_LOG_SPACING_SCALE;
+            g_logMaxGap           = BASE_LOG_MAX_GAP;
+            g_timerScale          = BASE_TIMER_SCALE;
+            g_timerMinMult        = BASE_TIMER_MIN_MULT;
+            g_baseTimerDuration   = BASE_TIMER_DURATION;
+            g_startingLives       = BASE_STARTING_LIVES;
+            break;
+    }
+}
+
+const char *difficulty_name(Difficulty d)
+{
+    switch (d)
+    {
+        case DIFF_EASY:   return "EASY";
+        case DIFF_HARD:   return "HARD";
+        case DIFF_MEDIUM:
+        default:          return "MEDIUM";
+    }
+}
+
+/* Computes the goal-row timer's remaining-time multiplier for a given
+   level, using whichever difficulty's scaling is currently active.
+   Replaces the timerMult calculation that used to be copy-pasted at
+   every spot the timer gets reset. */
+float compute_timer_mult(int level)
+{
+    float mult = 1.0f - (level - 1) * g_timerScale;
+    if (mult < g_timerMinMult) mult = g_timerMinMult;
+    return mult;
+}
 
 /* Car types for variety */
 
@@ -105,6 +212,9 @@
 typedef enum
 {
     STATE_MENU,
+    STATE_LEADERBOARD,
+    STATE_HOW_TO_PLAY,
+    STATE_CREDITS,
     STATE_PLAYING,
     STATE_PAUSED,
     STATE_LEVEL_COMPLETE,
@@ -127,12 +237,25 @@ typedef struct
     CarType type;
 } Object;
 
+typedef struct
+{
+    Rectangle rect;
+    float speed;
+    float phaseOffset;  /* for movement sync */
+} SharkFin;
+
+#define SHARK_FIN_COUNT 36  /* 6 per gap × 4 gaps + 6 left edge + 6 right edge = 36 total */
+#define SHARK_FIN_WIDTH 16
+#define SHARK_FIN_HEIGHT 14
+
 Texture2D carTexture;
 Texture2D carSportsTexture;
 Texture2D carTruckTexture;
+Texture2D turtleTexture;
 bool carTextureValid = false;
 bool carSportsTextureValid = false;
 bool carTruckTextureValid = false;
+bool turtleTextureValid = false;
 
 
 /* ================================================================
@@ -167,6 +290,97 @@ void save_high_score(int score)
         fprintf(f, "%d", score);
         fclose(f);
     }
+}
+
+
+/* ================================================================
+   SECTION: LEADERBOARD (TOP SCORERS)
+   A small text file storing the best runs across all sessions,
+   name + score per line, kept sorted highest-first and capped at
+   LEADERBOARD_MAX entries.
+   ================================================================ */
+
+#define LEADERBOARD_FILE "leaderboard.txt"
+#define LEADERBOARD_MAX 10
+
+typedef struct LeaderboardEntry
+{
+    char name[32];
+    int score;
+} LeaderboardEntry;
+
+/* Reads the leaderboard file into entries[], returns how many were read. */
+int load_leaderboard(LeaderboardEntry entries[LEADERBOARD_MAX])
+{
+    int count = 0;
+    FILE *f = fopen(LEADERBOARD_FILE, "r");
+
+    if (f != NULL)
+    {
+        while (count < LEADERBOARD_MAX &&
+               fscanf(f, "%31s %d", entries[count].name, &entries[count].score) == 2)
+        {
+            count++;
+        }
+        fclose(f);
+    }
+
+    return count;
+}
+
+void save_leaderboard(LeaderboardEntry entries[LEADERBOARD_MAX], int count)
+{
+    FILE *f = fopen(LEADERBOARD_FILE, "w");
+
+    if (f != NULL)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            fprintf(f, "%s %d\n", entries[i].name, entries[i].score);
+        }
+        fclose(f);
+    }
+}
+
+/* Inserts a new score into the leaderboard (name is always FROG_NAME,
+   since the game doesn't ask for player initials), keeps it sorted
+   highest-to-lowest, and trims it back down to LEADERBOARD_MAX entries.
+   Returns the 1-based rank the new score landed at, or -1 if it didn't
+   make the top LEADERBOARD_MAX. */
+int add_leaderboard_entry(int score)
+{
+    LeaderboardEntry entries[LEADERBOARD_MAX];
+    int count = load_leaderboard(entries);
+
+    /* find insertion point (descending order) */
+    int insertPos = count;
+    for (int i = 0; i < count; i++)
+    {
+        if (score > entries[i].score)
+        {
+            insertPos = i;
+            break;
+        }
+    }
+
+    if (insertPos >= LEADERBOARD_MAX)
+    {
+        return -1; /* didn't make the cut */
+    }
+
+    int newCount = (count < LEADERBOARD_MAX) ? count + 1 : LEADERBOARD_MAX;
+
+    /* shift everything at/after insertPos down by one, dropping the last if full */
+    for (int i = newCount - 1; i > insertPos; i--)
+    {
+        entries[i] = entries[i - 1];
+    }
+
+    TextCopy(entries[insertPos].name, FROG_NAME);
+    entries[insertPos].score = score;
+
+    save_leaderboard(entries, newCount);
+    return insertPos + 1;
 }
 
 
@@ -369,6 +583,96 @@ void draw_log(Object log, Texture2D logTex)
     DrawTexturePro(logTex, src, log.rect, origin, 0.0f, (Color){255, 220, 170, 255});
 }
 
+/* Draw a floating turtle-group "platform" in place of a log - a cluster
+   of 3 turtles sitting side by side, close enough together that they act
+   as one connected safe platform (collision still uses the same
+   rectangle as a log would, this only changes what's drawn on top).
+   Uses turtleTexture (assets/images/turtle.png) if it loaded correctly;
+   otherwise falls back to the hand-drawn shapes below so the game never
+   breaks just because an image is missing. */
+void draw_turtle_group(Rectangle rect, float speed)
+{
+    if (turtleTextureValid)
+    {
+        int turtleCount = 3;
+        float baseW = rect.width / turtleCount;   /* spacing between turtle centers stays anchored to the log-sized rect */
+        bool facingRight = (speed >= 0);
+
+        /* turtle.png has empty transparent padding around the actual shell -
+           crop to just the drawn content so turtles look bigger/closer
+           together instead of leaving invisible gaps between them. */
+        float contentX = 22, contentY = 10, contentW = 86, contentH = 71;
+
+        Rectangle src = {contentX, contentY, contentW, contentH};
+        if (!facingRight)
+        {
+            /* mirror within the same content box when moving left */
+            src.width = -contentW;
+        }
+        Vector2 origin = {0, 0};
+
+        /* draw each turtle bigger than the raw sprite but with a bit of
+           breathing room between them, so it reads as a connected group
+           without the shells crushing into each other. */
+        float drawW = baseW * 1.25f;
+        float drawH = rect.height * 1.1f;
+        float destY = rect.y + rect.height / 2.0f - drawH / 2.0f;
+
+        for (int t = 0; t < turtleCount; t++)
+        {
+            float centerX = rect.x + baseW * t + baseW / 2.0f;
+            Rectangle dest = {
+                centerX - drawW / 2.0f,
+                destY,
+                drawW,
+                drawH
+            };
+            DrawTexturePro(turtleTexture, src, dest, origin, 0.0f, WHITE);
+        }
+        return;
+    }
+
+    /* ---- fallback: hand-drawn turtle shapes (used if turtle.png fails to load) ---- */
+    Color shellColor  = (Color){190, 60, 45, 255};   /* red/orange-brown shell */
+    Color shellDark   = (Color){140, 40, 30, 255};   /* darker shell segments  */
+    Color headColor   = (Color){70, 150, 70, 255};   /* green head/neck        */
+    Color flipperColor= (Color){60, 130, 60, 255};   /* green flippers         */
+    Color eyeColor    = BLACK;
+
+    int turtleCount = 3;
+    float turtleW = rect.width / turtleCount;
+    bool facingRight = (speed >= 0);
+
+    for (int t = 0; t < turtleCount; t++)
+    {
+        float cx = rect.x + turtleW * t + turtleW / 2.0f;
+        float cy = rect.y + rect.height / 2.0f;
+        float shellRx = turtleW / 2.0f - 2.0f;
+        float shellRy = rect.height / 2.0f - 2.0f;
+
+        /* shell */
+        DrawEllipse((int)cx, (int)cy, shellRx, shellRy, shellColor);
+
+        /* simple shell segment lines (3 short darker lines across the shell) */
+        for (int s = -1; s <= 1; s++)
+        {
+            float lx = cx + s * (shellRx * 0.4f);
+            DrawLine((int)lx, (int)(cy - shellRy * 0.6f), (int)lx, (int)(cy + shellRy * 0.6f), shellDark);
+        }
+        DrawEllipseLines((int)cx, (int)cy, shellRx, shellRy, shellDark);
+
+        /* head - poking out on the side the turtle is "facing" */
+        float headOffsetX = facingRight ? shellRx * 0.9f : -shellRx * 0.9f;
+        float headCx = cx + headOffsetX;
+        DrawCircle((int)headCx, (int)cy, shellRy * 0.45f, headColor);
+        DrawCircle((int)(headCx + (facingRight ? 2 : -2)), (int)(cy - shellRy * 0.15f), 2, eyeColor);
+
+        /* small flippers poking out top and bottom */
+        DrawEllipse((int)(cx - shellRx * 0.3f), (int)(cy - shellRy * 0.85f), shellRx * 0.3f, shellRy * 0.35f, flipperColor);
+        DrawEllipse((int)(cx - shellRx * 0.3f), (int)(cy + shellRy * 0.85f), shellRx * 0.3f, shellRy * 0.35f, flipperColor);
+    }
+}
+
 
 /* ================================================================
    SECTION: LEVEL SETUP
@@ -377,15 +681,18 @@ void draw_log(Object log, Texture2D logTex)
    level.
    ================================================================ */
 
-void reset_level(Object cars[], Object logs[], bool goalFilled[], int level)
+void reset_level(Object cars[], Object logs[], SharkFin sharkFins[], bool goalFilled[], int level)
 {
-    float mult = 1.0f + (level - 1) * DIFFICULTY_STEP;
+    float mult = 1.0f + (level - 1) * g_difficultyStep;
 
-    /* Cars now sit fully inside the road band (390-560) and clear of
-       the two lane-divider lines - see the constants above. Three
-       lanes, three cars per lane for denser traffic. 
-       Rect dimensions here are BASE values; actual collision/draw size
-       depends on car type (see get_car_collision_rect / draw_car). */
+    /* Level-scaled spacing factors (clamped) */
+    float vehicleSpacingMult = 1.0f - (level - 1) * g_vehicleSpacingScale;
+    if (vehicleSpacingMult < g_vehicleMinSpacing) vehicleSpacingMult = g_vehicleMinSpacing;
+
+    float logGapMult = 1.0f + (level - 1) * g_logSpacingScale;
+    if (logGapMult > g_logMaxGap) logGapMult = g_logMaxGap;
+
+    /* Cars: base positions scaled by vehicleSpacingMult to reduce gaps between cars in same lane */
     Object baseCars[CAR_COUNT] =
     {
         {{100,  400, 80, 35},  2, 0},   /* Sedan - lane 1 */
@@ -401,29 +708,31 @@ void reset_level(Object cars[], Object logs[], bool goalFilled[], int level)
         {{750,  520, 70, 28},  3, 2}    /* Sports - lane 3 */
     };
 
-    /* Logs: 5 rows, spaced exactly LOG_ROW_STEP (40px) apart so they
-       line up with every row the frog can actually land on. */
+    /* Logs: base positions with gaps scaled by logGapMult (fewer/sparser logs) */
     Object baseLogs[LOG_COUNT] =
     {
         {{40,  RIVER_TOP + 0 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0},
-        {{450, RIVER_TOP + 0 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0},
+        {{(int)(450 * logGapMult), RIVER_TOP + 0 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0},
 
         {{120, RIVER_TOP + 1 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
-        {{520, RIVER_TOP + 1 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
+        {{(int)(520 * logGapMult), RIVER_TOP + 1 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
 
         {{60,  RIVER_TOP + 2 * LOG_ROW_STEP, 150, LOG_HEIGHT},  3, 0},
-        {{470, RIVER_TOP + 2 * LOG_ROW_STEP, 150, LOG_HEIGHT},  3, 0},
+        {{(int)(470 * logGapMult), RIVER_TOP + 2 * LOG_ROW_STEP, 150, LOG_HEIGHT},  3, 0},
 
         {{180, RIVER_TOP + 3 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
-        {{600, RIVER_TOP + 3 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
+        {{(int)(600 * logGapMult), RIVER_TOP + 3 * LOG_ROW_STEP, 150, LOG_HEIGHT}, -2, 0},
 
         {{20,  RIVER_TOP + 4 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0},
-        {{430, RIVER_TOP + 4 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0}
+        {{(int)(430 * logGapMult), RIVER_TOP + 4 * LOG_ROW_STEP, 150, LOG_HEIGHT},  2, 0}
     };
 
     for (int i = 0; i < CAR_COUNT; i++)
     {
         cars[i] = baseCars[i];
+        /* Scale x-positions of cars in same lane to reduce spacing */
+        if (i % 3 == 1) cars[i].rect.x = (int)(baseCars[i].rect.x * vehicleSpacingMult);
+        else if (i % 3 == 2) cars[i].rect.x = (int)(baseCars[i].rect.x * vehicleSpacingMult);
         cars[i].speed *= mult;
     }
 
@@ -431,6 +740,78 @@ void reset_level(Object cars[], Object logs[], bool goalFilled[], int level)
     {
         logs[i] = baseLogs[i];
         logs[i].speed *= mult;
+    }
+
+    /* Shark fins in goal-row water gaps: 3 fins per gap (12 total), centered in each of 4 gaps */
+    float bayWidth = (float)SCREEN_WIDTH / GOAL_SLOT_COUNT;
+    int bayTop = 25;
+    int bayHeight = GOAL_HEIGHT - 25;  /* 95px */
+    int centerY = bayTop + bayHeight / 2;
+    const int FINS_PER_GAP = 6;
+    const int GAP_COUNT = 4;
+
+    for (int gap = 0; gap < GAP_COUNT; gap++)
+    {
+        int barrierX = (int)(bayWidth * (gap + 1));
+        int centerX = barrierX;
+
+        for (int f = 0; f < FINS_PER_GAP; f++)
+        {
+            int finIndex = gap * FINS_PER_GAP + f;
+
+            /* Spread 6 fins vertically within the gap, with slight horizontal stagger */
+            float vOffset = (f - 2.5f) * 14.0f;  /* -35, -21, -7, +7, +21, +35 pixels */
+            float hOffset = (f % 2 == 0 ? -1 : 1) * 8.0f;  /* alternate left/right */
+
+            sharkFins[finIndex].rect = (Rectangle){
+                centerX - SHARK_FIN_WIDTH / 2 + (int)hOffset,
+                centerY - SHARK_FIN_HEIGHT / 2 + (int)vOffset,
+                SHARK_FIN_WIDTH,
+                SHARK_FIN_HEIGHT
+            };
+            /* Static obstacles - no movement */
+            sharkFins[finIndex].speed = 0.0f;
+            sharkFins[finIndex].phaseOffset = finIndex * 0.5f;
+        }
+    }
+
+    /* 6 fins on left edge (left of leftmost goal slot) */
+    const int EDGE_FINS = 6;
+    int leftSlotLeft = 100 - 84/2;  /* 58 - left edge of first goal slot */
+    int leftEdgeX = leftSlotLeft - 24;  /* 24px left of slot edge */
+    for (int f = 0; f < EDGE_FINS; f++)
+    {
+        int finIndex = GAP_COUNT * FINS_PER_GAP + f;
+        float vOffset = (f - 2.5f) * 14.0f;  /* -35, -21, -7, +7, +21, +35 */
+        float hOffset = (f % 2 == 0 ? -1 : 1) * 8.0f;  /* alternate left/right, same as gap fins */
+
+        sharkFins[finIndex].rect = (Rectangle){
+            leftEdgeX - SHARK_FIN_WIDTH / 2 + (int)hOffset,
+            centerY - SHARK_FIN_HEIGHT / 2 + (int)vOffset,
+            SHARK_FIN_WIDTH,
+            SHARK_FIN_HEIGHT
+        };
+        sharkFins[finIndex].speed = 0.0f;
+        sharkFins[finIndex].phaseOffset = finIndex * 0.5f;
+    }
+
+    /* 6 fins on right edge (right of rightmost goal slot) */
+    int rightSlotRight = 900 + 84/2;  /* 942 - right edge of last goal slot */
+    int rightEdgeX = rightSlotRight + 24;  /* 24px right of slot edge */
+    for (int f = 0; f < EDGE_FINS; f++)
+    {
+        int finIndex = GAP_COUNT * FINS_PER_GAP + EDGE_FINS + f;
+        float vOffset = (f - 2.5f) * 14.0f;  /* -35, -21, -7, +7, +21, +35 */
+        float hOffset = (f % 2 == 0 ? -1 : 1) * 8.0f;  /* alternate left/right, same as gap fins */
+
+        sharkFins[finIndex].rect = (Rectangle){
+            rightEdgeX - SHARK_FIN_WIDTH / 2 + (int)hOffset,
+            centerY - SHARK_FIN_HEIGHT / 2 + (int)vOffset,
+            SHARK_FIN_WIDTH,
+            SHARK_FIN_HEIGHT
+        };
+        sharkFins[finIndex].speed = 0.0f;
+        sharkFins[finIndex].phaseOffset = finIndex * 0.5f;
     }
 
     for (int i = 0; i < GOAL_SLOT_COUNT; i++)
@@ -447,9 +828,8 @@ void reset_level(Object cars[], Object logs[], bool goalFilled[], int level)
    single-colour rectangles.
    ================================================================ */
 
-/* Goal area: classic Frogger-style 5 home bays with dangerous barriers between.
-   Each bay is a safe "home" slot. Barriers between bays have animated hazards. */
-void draw_goal_area(bool goalFilled[], Texture2D frogTex, int level, int score)
+/* Goal area: 5 home bays floating on water with gaps between them */
+void draw_goal_area(bool goalFilled[], SharkFin sharkFins[], Texture2D frogTex, int level, int score)
 {
     /* Top decorative area */
     DrawRectangle(0, GOAL_TOP, SCREEN_WIDTH, 25, (Color){30, 100, 40, 255});
@@ -467,23 +847,78 @@ void draw_goal_area(bool goalFilled[], Texture2D frogTex, int level, int score)
     int scoreW = MeasureText(scoreLabel, 22);
     DrawText(scoreLabel, scoreX - scoreW / 2, 2, 22, (Color){255, 230, 120, 255});
 
+    /* Water colors (matching river section) */
+    Color waterColor = (Color){35, 130, 220, 255};
+    Color waveColor = (Color){140, 195, 240, 130};
+
     /* Bay dimensions */
     int bayCount = GOAL_SLOT_COUNT;
     int bayTop = 25;
     int bayHeight = GOAL_HEIGHT - 25;  /* 95px */
+
+    float time = (float)GetTime();
+
+    /* First, draw water everywhere in the goal area below the top bar */
+    DrawRectangle(0, bayTop, SCREEN_WIDTH, bayHeight, waterColor);
+
+    /* Animated wave lines across the entire goal area (including gaps and under bays) */
+    for (int i = 0; i < 5; i++)
+    {
+        float waveY = bayTop + 16 + i * 22;
+        float offset = sinf(time * 1.6f + i * 1.3f) * 10.0f;
+        DrawLineEx(
+            (Vector2){0 + offset, waveY},
+            (Vector2){SCREEN_WIDTH + offset, waveY},
+            2.0f,
+            waveColor
+        );
+    }
+
+    /* Goal slots (floating platforms on water) - smaller and square */
+    float roundness = 0.2f;  /* moderate corner radius */
+    int shadowOffset = 3;
+    int slotSize = 84;  /* square size in pixels */
 
     for (int i = 0; i < bayCount; i++)
     {
         int bx = (int)(bayWidth * i);
         int bw = (int)bayWidth;
 
+        /* Slot centered in bay */
+        int slotLeft = bx + bw/2 - slotSize/2;
+        int slotTop = bayTop + bayHeight/2 - slotSize/2;
+        int slotWidth = slotSize;
+        int slotHeight = slotSize;
+
+        /* Drop shadow beneath slot (draw first, so it's behind the slot) */
+        DrawRectangleRounded(
+            (Rectangle){slotLeft + shadowOffset, slotTop + shadowOffset, (float)slotWidth, (float)slotHeight},
+            roundness, 8,
+            Fade((Color){0, 0, 0, 255}, 0.25f)
+        );
+
+        /* Thin dark-blue water ring/outline beneath slot to sell the "floating" look */
+        DrawRectangleRoundedLines(
+            (Rectangle){slotLeft - 2, slotTop - 2, (float)slotWidth + 4, (float)slotHeight + 4},
+            roundness, 8,
+            (Color){20, 80, 160, 255}
+        );
+
         /* Bay background - claimed bays show light green, empty show water decoration */
         Color bayBg = goalFilled[i] ? (Color){100, 200, 48, 255} : (Color){40, 150, 50, 255};
-        DrawRectangle(bx + 2, bayTop + 2, bw - 4, bayHeight - 4, bayBg);
+        DrawRectangleRounded(
+            (Rectangle){slotLeft, slotTop, (float)slotWidth, (float)slotHeight},
+            roundness, 8,
+            bayBg
+        );
 
-        /* Bay border */
+        /* Bay border (rounded) */
         Color borderColor = goalFilled[i] ? (Color){180, 150, 50, 255} : (Color){20, 90, 30, 255};
-        DrawRectangleLinesEx((Rectangle){bx + 2, bayTop + 2, bw - 4, bayHeight - 4}, 3, borderColor);
+        DrawRectangleRoundedLines(
+            (Rectangle){slotLeft, slotTop, (float)slotWidth, (float)slotHeight},
+            roundness, 8,
+            borderColor
+        );
 
         if (goalFilled[i])
         {
@@ -512,53 +947,55 @@ void draw_goal_area(bool goalFilled[], Texture2D frogTex, int level, int score)
         }
     }
 
-    /* Barriers BETWEEN bays - with animated hazards */
-    float time = (float)GetTime();
+    /* Draw shark fins in water gaps (on top of water, under/over slots) */
+    Color finColor = (Color){60, 70, 85, 255};      /* dark blue-gray */
+    Color finEdgeColor = (Color){40, 50, 65, 255};  /* darker edge */
+    Color wakeColor = (Color){180, 200, 220, 180};  /* subtle white wake */
 
-    for (int i = 0; i < bayCount - 1; i++)
+    for (int i = 0; i < SHARK_FIN_COUNT; i++)
     {
-        int barrierX = (int)(bayWidth * (i + 1));
-        int barrierWidth = 28;  /* Width of the barrier zone */
-        int left = barrierX - barrierWidth/2;
-        int right = barrierX + barrierWidth/2;
+        Rectangle r = sharkFins[i].rect;
+        bool movingRight = sharkFins[i].speed > 0;
 
-        /* Barrier base - dark stone/wall */
-        DrawRectangle(left, bayTop, barrierWidth, bayHeight, (Color){40, 35, 35, 255});
-        DrawRectangleLines(left, bayTop, barrierWidth, bayHeight, (Color){80, 75, 75, 255});
+        /* Fin triangle: pointed top, wider base at water surface */
+        int finTipX = (int)(r.x + r.width / 2);
+        int finTipY = (int)(r.y);
+        int finBaseY = (int)(r.y + r.height);
+        int halfBase = (int)(r.width / 2);
 
-        /* Animated hazard: Alligator heads popping up */
-        Color gatorColor = (Color){50, 140, 50, 255};
-        Color gatorDark = (Color){35, 110, 35, 255};
-        Color eyeColor = (Color){255, 255, 100, 255};
+        /* Slight curve on leading edge: leading point slightly forward */
+        int leadOffset = movingRight ? 3 : -3;
 
-        for (int g = 0; g < 3; g++)
+        /* Main fin triangle */
+        DrawTriangle(
+            (Vector2){finTipX + leadOffset, finTipY},
+            (Vector2){finTipX - halfBase, finBaseY},
+            (Vector2){finTipX + halfBase, finBaseY},
+            finColor
+        );
+
+        /* Darker edge line along leading edge for depth */
+        DrawLineEx(
+            (Vector2){finTipX + leadOffset, finTipY},
+            (Vector2){finTipX - halfBase, finBaseY},
+            2.0f,
+            finEdgeColor
+        );
+
+        /* Trailing wake: thin curved line behind fin (scaled to smaller fin) */
+        int wakeLen = 8;
+        int wakeStartX = finTipX + (movingRight ? -halfBase : halfBase);
+        int wakeStartY = finBaseY - 2;
+        for (int w = 0; w < 2; w++)
         {
-            float gatorY = bayTop + 15 + g * 28;
-            /* Bobbing animation */
-            float bob = sinf(time * 1.5f + i * 2.0f + g * 1.8f) * 6.0f;
-            int gy = (int)(gatorY + bob);
-
-            /* Gator head body */
-            DrawCircle(left + barrierWidth/2, gy, 12, gatorColor);
-            DrawCircle(left + barrierWidth/2 - 3, gy - 2, 5, eyeColor);
-            DrawCircle(left + barrierWidth/2 + 3, gy - 2, 5, eyeColor);
-            DrawCircle(left + barrierWidth/2 - 3, gy - 2, 2, BLACK);
-            DrawCircle(left + barrierWidth/2 + 3, gy - 2, 2, BLACK);
-
-            /* Snout */
-            DrawTriangle(
-                (Vector2){left + barrierWidth/2 - 8, gy + 5},
-                (Vector2){left + barrierWidth/2, gy + 14},
-                (Vector2){left + barrierWidth/2 + 8, gy + 5},
-                gatorDark
+            int wx = wakeStartX + (movingRight ? -w * 3 : w * 3);
+            int wy = wakeStartY + w * 2;
+            DrawLineEx(
+                (Vector2){wx, wy},
+                (Vector2){wx + (movingRight ? -2 : 2), wy + 1},
+                1.0f,
+                Fade(wakeColor, 0.5f - w * 0.2f)
             );
-        }
-
-        /* Warning stripes on barrier edges */
-        for (int s = 0; s < bayHeight; s += 16)
-        {
-            Color stripe = (s % 32 == 0) ? (Color){255, 220, 50, 255} : (Color){140, 30, 30, 255};
-            DrawRectangle(left, bayTop + s, barrierWidth, 8, stripe);
         }
     }
 }
@@ -644,7 +1081,7 @@ void draw_sand_band(int y, int height)
    SECTION: SCREENS / OVERLAYS (menu, pause, level complete, game over, HUD)
    ================================================================ */
 
-void draw_menu(int highScore, Texture2D startBgTex)
+void draw_menu(int highScore, Texture2D startBgTex, bool musicMuted)
 {
     /* Draw the detailed background image (contains title, frog-lives box, flowers, butterflies, lily pads, logs, turtles) */
     DrawTexturePro(
@@ -699,9 +1136,45 @@ void draw_menu(int highScore, Texture2D startBgTex)
         DrawText(startText, startBgX + startPadding, startBgY + startPadding, startSize, Fade(YELLOW, pulseAlpha));
     }
 
+    /* DIFFICULTY SELECTOR - just below the start prompt, cycled with LEFT/RIGHT (or A/D) */
+    {
+        const char *diffText = TextFormat("< DIFFICULTY: %s >", difficulty_name(currentDifficulty));
+        int diffSize = 22;
+        int diffW = MeasureText(diffText, diffSize);
+        int diffPadding = 10;
+        int diffBgW = diffW + diffPadding * 2;
+        int diffBgH = diffSize + diffPadding * 2;
+        int diffBgX = (SCREEN_WIDTH - diffBgW) / 2;
+        int diffBgY = 200 + 32 + 24 + 12;  /* just under the start-prompt box */
+
+        Color diffColor = (currentDifficulty == DIFF_EASY) ? (Color){120, 220, 120, 255}
+                         : (currentDifficulty == DIFF_HARD) ? (Color){230, 90, 90, 255}
+                         : (Color){255, 210, 90, 255};
+
+        DrawRectangleRounded((Rectangle){diffBgX, diffBgY, diffBgW, diffBgH}, 6, 8, Fade(BLACK, 0.5f));
+        DrawText(diffText, diffBgX + diffPadding, diffBgY + diffPadding, diffSize, diffColor);
+    }
+
+    /* MUSIC MUTE INDICATOR - just below the difficulty selector */
+    {
+        const char *musicText = musicMuted ? "MUSIC: OFF (M to unmute)" : "MUSIC: ON (M to mute)";
+        int musicSize = 18;
+        int musicW = MeasureText(musicText, musicSize);
+        int musicPadding = 8;
+        int musicBgW = musicW + musicPadding * 2;
+        int musicBgH = musicSize + musicPadding * 2;
+        int musicBgX = (SCREEN_WIDTH - musicBgW) / 2;
+        int musicBgY = 200 + 32 + 24 + 12 + (22 + 20) + 8;  /* just under the difficulty box */
+
+        Color musicColor = musicMuted ? (Color){160, 160, 160, 255} : (Color){140, 220, 255, 255};
+
+        DrawRectangleRounded((Rectangle){musicBgX, musicBgY, musicBgW, musicBgH}, 6, 8, Fade(BLACK, 0.5f));
+        DrawText(musicText, musicBgX + musicPadding, musicBgY + musicPadding, musicSize, musicColor);
+    }
+
     /* CONTROLS text - at very bottom in stone/sand border strip */
     {
-        const char *controls = "ARROW KEYS or WASD = Move    P = Pause";
+        const char *controls = "P=Pause  L=Leaderboard  H=How to Play  C=Credits  </>=Difficulty  M=Mute";
         int ctrlSize = 16;
         int ctrlW = MeasureText(controls, ctrlSize);
         int ctrlPadding = 10;
@@ -718,6 +1191,162 @@ void draw_menu(int highScore, Texture2D startBgTex)
     }
 }
 
+/* Top-scorers screen - lists the best runs saved to leaderboard.txt,
+   highest score first. Reached from the main menu by pressing L. */
+void draw_leaderboard(void)
+{
+    DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){10, 40, 20, 255});
+
+    const char *title = "TOP SCORERS";
+    int titleSize = 40;
+    DrawText(title, SCREEN_WIDTH / 2 - MeasureText(title, titleSize) / 2, 40, titleSize, GOLD);
+
+    LeaderboardEntry entries[LEADERBOARD_MAX];
+    int count = load_leaderboard(entries);
+
+    int rowY = 120;
+    int rowHeight = 34;
+
+    if (count == 0)
+    {
+        const char *empty = "No scores yet - go set one!";
+        DrawText(empty, SCREEN_WIDTH / 2 - MeasureText(empty, 22) / 2, rowY, 22, LIGHTGRAY);
+    }
+    else
+    {
+        for (int i = 0; i < count; i++)
+        {
+            Color rowColor = (i == 0) ? GOLD : (i == 1) ? (Color){200, 200, 210, 255} : (i == 2) ? (Color){205, 140, 80, 255} : RAYWHITE;
+
+            const char *rankStr = TextFormat("%2d.", i + 1);
+            const char *nameStr = entries[i].name;
+            const char *scoreStr = TextFormat("%d", entries[i].score);
+
+            int fontSize = 24;
+            int leftColX = SCREEN_WIDTH / 2 - 160;
+            int nameColX = SCREEN_WIDTH / 2 - 100;
+            int scoreColX = SCREEN_WIDTH / 2 + 100;
+
+            DrawText(rankStr, leftColX, rowY + i * rowHeight, fontSize, rowColor);
+            DrawText(nameStr, nameColX, rowY + i * rowHeight, fontSize, rowColor);
+            DrawText(scoreStr, scoreColX - MeasureText(scoreStr, fontSize), rowY + i * rowHeight, fontSize, rowColor);
+        }
+    }
+
+    const char *backHint = "Press ENTER or ESC to go back";
+    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 50, 18, (Color){255, 230, 120, 255});
+}
+
+/* How-to-play screen - explains controls and rules. Reached from the
+   main menu by pressing H. */
+void draw_how_to_play(void)
+{
+    DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){10, 30, 50, 255});
+
+    const char *title = "HOW TO PLAY";
+    int titleSize = 38;
+    DrawText(title, SCREEN_WIDTH / 2 - MeasureText(title, titleSize) / 2, 30, titleSize, (Color){120, 200, 255, 255});
+
+    int fontSize = 20;
+    int lineHeight = 30;
+    int y = 100;
+    int x = 60;
+
+    const char *lines[] = {
+        "GOAL: Guide your frog safely into all 5 empty goal slots",
+        "at the top of the screen to clear the level.",
+        "",
+        "CONTROLS:",
+        "  Arrow Keys or WASD  -  Hop up / down / left / right",
+        "  P                   -  Pause the game",
+        "",
+        "OBSTACLES:",
+        "  Cars & trucks (road)     - touching one costs a life",
+        "  Water (river)            - falling in costs a life,",
+        "                             unless you're on a log or turtle",
+        "  Logs & turtles           - safe rides across the river,",
+        "                             float with the current",
+        "  Crabs & other hazards    - avoid these near the goal slots",
+        "",
+        "TIMER: Each attempt has a countdown shown top-right and as",
+        "a bar in the goal row - reach a goal before it runs out!",
+        "",
+        "LIVES & SCORING: You start with a set number of lives",
+        "(fewer on Hard, more on Easy). Reaching a goal scores points;",
+        "running out of lives ends the game."
+    };
+    int lineCount = sizeof(lines) / sizeof(lines[0]);
+
+    for (int i = 0; i < lineCount; i++)
+    {
+        Color lineColor = RAYWHITE;
+        if (TextIsEqual(lines[i], "CONTROLS:") || TextIsEqual(lines[i], "OBSTACLES:"))
+        {
+            lineColor = (Color){255, 210, 90, 255};
+        }
+        DrawText(lines[i], x, y + i * lineHeight, fontSize, lineColor);
+    }
+
+    const char *backHint = "Press ENTER or ESC to go back";
+    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 40, 18, (Color){255, 230, 120, 255});
+}
+
+/* Credits screen - attribution for external resources used in the
+   project. Reached from the main menu by pressing C. */
+void draw_credits(void)
+{
+    DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){20, 20, 30, 255});
+
+    const char *title = "CREDITS";
+    int titleSize = 38;
+    DrawText(title, SCREEN_WIDTH / 2 - MeasureText(title, titleSize) / 2, 30, titleSize, (Color){220, 190, 255, 255});
+
+    int fontSize = 19;
+    int lineHeight = 28;
+    int y = 110;
+    int x = 60;
+
+    /* NOTE: fill in the actual source/author/license for each asset you
+       used below - this list only has placeholders for whatever you
+       downloaded (background art, car/turtle sprites, sound effects). */
+    const char *lines[] = {
+        "GAME DESIGN & PROGRAMMING",
+        "  Zisin",
+        "",
+        "BACKGROUND ART",
+        "  Start-screen river background - [source / author / license]",
+        "",
+        "SPRITES",
+        "  Vehicle sprites (car, sports car, truck) - [source / author / license]",
+        "  Turtle sprite - original artwork made for this project",
+        "",
+        "SOUND EFFECTS",
+        "  Jump, crash, splash, goal, level up, game over -",
+        "  [source / author / license, e.g. freesound.org / Kenney.nl]",
+        "",
+        "BUILT WITH",
+        "  raylib (https://www.raylib.com)",
+    };
+    int lineCount = sizeof(lines) / sizeof(lines[0]);
+
+    for (int i = 0; i < lineCount; i++)
+    {
+        Color lineColor = RAYWHITE;
+        if (TextIsEqual(lines[i], "GAME DESIGN & PROGRAMMING") ||
+            TextIsEqual(lines[i], "BACKGROUND ART") ||
+            TextIsEqual(lines[i], "SPRITES") ||
+            TextIsEqual(lines[i], "SOUND EFFECTS") ||
+            TextIsEqual(lines[i], "BUILT WITH"))
+        {
+            lineColor = (Color){255, 210, 90, 255};
+        }
+        DrawText(lines[i], x, y + i * lineHeight, fontSize, lineColor);
+    }
+
+    const char *backHint = "Press ENTER or ESC to go back";
+    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 40, 18, (Color){255, 230, 120, 255});
+}
+
 void draw_pause_overlay(void)
 {
     DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, Fade(BLACK, 0.6f));
@@ -732,29 +1361,34 @@ void draw_level_complete_overlay(int level)
     const char *msg = TextFormat("LEVEL %d COMPLETE!", level);
     DrawText(msg, SCREEN_WIDTH / 2 - MeasureText(msg, 45) / 2, SCREEN_HEIGHT / 2 - 40, 45, GOLD);
 
-    const char *next = TextFormat("Get ready for level %d...", level + 1);
-    DrawText(next, SCREEN_WIDTH / 2 - MeasureText(next, 20) / 2, SCREEN_HEIGHT / 2 + 30, 20, (Color){255, 230, 120, 255});
+    const char *next = "Press ENTER to start next LEVEL";
+    DrawText(next, SCREEN_WIDTH / 2 - MeasureText(next, 22) / 2, SCREEN_HEIGHT / 2 + 30, 22, (Color){255, 230, 120, 255});
 }
 
 void draw_game_over_overlay(int score, int highScore, bool isNewHighScore)
 {
     DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, Fade(BLACK, 0.7f));
 
-    DrawText("khela parena", 260, 210, 50, RED);
+    const char *gameOverText = "khela parena";
+    DrawText(gameOverText, GetScreenWidth() / 2 - MeasureText(gameOverText, 50) / 2, 210, 50, RED);
 
-    DrawText(TextFormat("Final Score: %d", score), 315, 280, 25, (Color){255, 230, 120, 255});
-    DrawText(TextFormat("High Score: %d", highScore), 315, 315, 25, (Color){255, 220, 60, 255});
+    const char *finalScoreText = TextFormat("Final Score: %d", score);
+    DrawText(finalScoreText, GetScreenWidth() / 2 - MeasureText(finalScoreText, 25) / 2, 280, 25, (Color){255, 230, 120, 255});
+
+    const char *highScoreText = TextFormat("High Score: %d", highScore);
+    DrawText(highScoreText, GetScreenWidth() / 2 - MeasureText(highScoreText, 25) / 2, 315, 25, (Color){255, 220, 60, 255});
 
     if (isNewHighScore)
     {
-        DrawText("NEW HIGH SCORE!", SCREEN_WIDTH / 2 - MeasureText("NEW HIGH SCORE!", 22) / 2, 350, 22, (Color){255, 200, 0, 255});
+        DrawText("NEW HIGH SCORE!", GetScreenWidth() / 2 - MeasureText("NEW HIGH SCORE!", 22) / 2, 350, 22, (Color){255, 200, 0, 255});
     }
 
-    DrawText("Press R to Restart", 290, 400, 25, (Color){255, 230, 120, 255});
+    const char *restartText = "Press R to Restart";
+    DrawText(restartText, GetScreenWidth() / 2 - MeasureText(restartText, 25) / 2, 400, 25, (Color){255, 230, 120, 255});
 }
 
 /* Score/level/timer text plus the heart-based lives display */
-void draw_hud(int lives, float timeRemaining)
+void draw_hud(int lives, float timeRemaining, bool musicMuted)
 {
     /* HUD bar spans y=0 to y=25 (top decorative area in draw_goal_area).
        Vertical center = 12.5, so use y=12 for heart centers and y=2 for text baseline. */
@@ -777,8 +1411,8 @@ void draw_hud(int lives, float timeRemaining)
         draw_heart(heartsStartX + i * heartSpacing, heartCenterY, heartSize, (Color){220, 40, 60, 255});
     }
 
-    /* TOP-RIGHT: mini time bar (30s max) */
-    float maxTime = 30.0f;
+    /* TOP-RIGHT: mini time bar (30s max), with a small music mute icon just left of it */
+    float maxTime = g_baseTimerDuration;
     float pct = timeRemaining / maxTime;
     if (pct < 0.0f) pct = 0.0f;
     if (pct > 1.0f) pct = 1.0f;
@@ -795,6 +1429,18 @@ void draw_hud(int lives, float timeRemaining)
     DrawRectangle(barX, barY, (int)(barWidth * pct), barHeight, barColor);
     /* Bar border */
     DrawRectangleLines(barX, barY, barWidth, barHeight, (Color){180, 180, 180, 255});
+
+    /* Music mute indicator - a small note icon, dimmed/crossed when muted */
+    int noteX = barX - 26;
+    int noteY = 12;
+    Color noteColor = musicMuted ? (Color){120, 120, 120, 255} : (Color){255, 230, 120, 255};
+    DrawCircle(noteX, noteY + 5, 4, noteColor);
+    DrawRectangle(noteX + 3, noteY - 6, 2, 11, noteColor);
+    DrawRectangle(noteX + 3, noteY - 6, 7, 3, noteColor);
+    if (musicMuted)
+    {
+        DrawLine(noteX - 6, noteY - 8, noteX + 10, noteY + 10, RED);
+    }
 }
 
 
@@ -813,6 +1459,8 @@ int main(void)
     InitAudioDevice();
     SetTargetFPS(60);
 
+    apply_difficulty(currentDifficulty);  /* set up MEDIUM defaults before anything reads g_* values */
+
     /* ------------- load assets ------------- */
 
     TraceLog(LOG_INFO, "Working directory: %s", GetWorkingDirectory());
@@ -823,10 +1471,12 @@ int main(void)
     carTruckTexture = LoadTexture("assets/images/car_truck.png");
     Texture2D logTex  = LoadTexture("assets/images/log.png");
     Texture2D startBgTex = LoadTexture("assets/start_bg.png");
+    turtleTexture = LoadTexture("assets/images/turtle.png");
 
     carTextureValid = (carTexture.id != 0);
     carSportsTextureValid = (carSportsTexture.id != 0);
     carTruckTextureValid = (carTruckTexture.id != 0);
+    turtleTextureValid = (turtleTexture.id != 0);
 
     if (frogTex.id == 0 || logTex.id == 0)
     {
@@ -838,6 +1488,7 @@ int main(void)
     if (!carTextureValid) TraceLog(LOG_WARNING, "Failed to load assets/images/car.png, using fallback");
     if (!carSportsTextureValid) TraceLog(LOG_WARNING, "Failed to load assets/images/car_sports.png, using fallback");
     if (!carTruckTextureValid) TraceLog(LOG_WARNING, "Failed to load assets/images/car_truck.png, using fallback");
+    if (!turtleTextureValid) TraceLog(LOG_WARNING, "Failed to load assets/images/turtle.png, using drawn fallback");
 
     Sound sndJump     = LoadSound("assets/sounds/jump.wav");
     Sound sndCrash    = LoadSound("assets/sounds/crash.wav");
@@ -850,6 +1501,22 @@ int main(void)
         sndGoal.frameCount == 0 || sndLevelUp.frameCount == 0 || sndGameOver.frameCount == 0)
     {
         TraceLog(LOG_WARNING, "Some sound assets failed to load (continuing without sound)");
+    }
+
+    /* Background music - streamed from disk with automatic looping.
+       Music streams handle continuous playback and looping natively. */
+    Music bgMusic = LoadMusicStream("assets/sounds/bgm.wav");
+    bool bgMusicValid = IsMusicValid(bgMusic);
+    bool musicMuted = false;
+
+    if (bgMusicValid)
+    {
+        SetMusicVolume(bgMusic, 0.5f);
+        PlayMusicStream(bgMusic);
+    }
+    else
+    {
+        TraceLog(LOG_WARNING, "Failed to load assets/sounds/bgm.wav, continuing without music");
     }
 
     /* nicer, more natural-looking per-lane car colours */
@@ -878,14 +1545,15 @@ int main(void)
 
     Object cars[CAR_COUNT];
     Object logs[LOG_COUNT];
+    SharkFin sharkFins[SHARK_FIN_COUNT];
     bool goalFilled[GOAL_SLOT_COUNT];
 
     int score = 0;
-    int lives = 3;
+    int lives = g_startingLives;
     int level = 1;
-    float timeRemaining = 30.0f;  /* 30-second countdown timer */
+    float timeRemaining = g_baseTimerDuration * compute_timer_mult(level); /* 30-second countdown timer */
 
-    reset_level(cars, logs, goalFilled, level);
+    reset_level(cars, logs, sharkFins, goalFilled, level);
 
     float levelCompleteTimer = 0.0f;
     bool gameOverSoundPlayed = false;
@@ -895,6 +1563,34 @@ int main(void)
         float dt = GetFrameTime();
         float time = (float)GetTime();
 
+        /* ------------- music (plays/loops regardless of screen) ------------- */
+
+        if (bgMusicValid)
+        {
+            UpdateMusicStream(bgMusic);
+        }
+
+        if (bgMusicValid && !musicMuted && !IsMusicStreamPlaying(bgMusic))
+        {
+            PlayMusicStream(bgMusic);
+        }
+
+        if (IsKeyPressed(KEY_M))
+        {
+            musicMuted = !musicMuted;
+            if (bgMusicValid)
+            {
+                if (musicMuted)
+                {
+                    PauseMusicStream(bgMusic);
+                }
+                else
+                {
+                    ResumeMusicStream(bgMusic);
+                }
+            }
+        }
+
         /* ------------- input / state transitions ------------- */
 
         if (state == STATE_MENU)
@@ -902,14 +1598,61 @@ int main(void)
             if (IsKeyPressed(KEY_ENTER))
             {
                 score = 0;
-                lives = 3;
+                lives = g_startingLives;
                 level = 1;
-                timeRemaining = 30.0f;
+                timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                 newHighScoreThisRun = false;
                 gameOverSoundPlayed = false;
                 reset_frog(&frog);
-                reset_level(cars, logs, goalFilled, level);
+                reset_level(cars, logs, sharkFins, goalFilled, level);
                 state = STATE_PLAYING;
+            }
+            else if (IsKeyPressed(KEY_L))
+            {
+                state = STATE_LEADERBOARD;
+            }
+            else if (IsKeyPressed(KEY_H))
+            {
+                state = STATE_HOW_TO_PLAY;
+            }
+            else if (IsKeyPressed(KEY_C))
+            {
+                state = STATE_CREDITS;
+            }
+            else if (IsKeyPressed(KEY_LEFT) || IsKeyPressed(KEY_A))
+            {
+                if (currentDifficulty == DIFF_EASY) currentDifficulty = DIFF_HARD;
+                else if (currentDifficulty == DIFF_MEDIUM) currentDifficulty = DIFF_EASY;
+                else currentDifficulty = DIFF_MEDIUM;
+                apply_difficulty(currentDifficulty);
+            }
+            else if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D))
+            {
+                if (currentDifficulty == DIFF_EASY) currentDifficulty = DIFF_MEDIUM;
+                else if (currentDifficulty == DIFF_MEDIUM) currentDifficulty = DIFF_HARD;
+                else currentDifficulty = DIFF_EASY;
+                apply_difficulty(currentDifficulty);
+            }
+        }
+        else if (state == STATE_LEADERBOARD)
+        {
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            {
+                state = STATE_MENU;
+            }
+        }
+        else if (state == STATE_HOW_TO_PLAY)
+        {
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            {
+                state = STATE_MENU;
+            }
+        }
+        else if (state == STATE_CREDITS)
+        {
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            {
+                state = STATE_MENU;
             }
         }
         else if (state == STATE_PLAYING)
@@ -923,7 +1666,7 @@ int main(void)
             if (timeRemaining <= 0.0f)
             {
                 lives--;
-                timeRemaining = 30.0f;
+                timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                 if (sndGameOver.frameCount > 0) PlaySound(sndGameOver);
                 reset_frog(&frog);
             }
@@ -1000,7 +1743,7 @@ int main(void)
                 if (CheckCollisionRecs(frogRect, carRect))
                 {
                     lives--;
-                    timeRemaining = 30.0f;
+                    timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                     if (sndCrash.frameCount > 0) PlaySound(sndCrash);
                     reset_frog(&frog);
                     break;
@@ -1025,7 +1768,7 @@ int main(void)
                 if (!logerupor)
                 {
                     lives--;
-                    timeRemaining = 30.0f;
+                    timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                     if (sndSplash.frameCount > 0) PlaySound(sndSplash); /* drowning sound */
                     reset_frog(&frog);
                 }
@@ -1081,6 +1824,20 @@ int main(void)
                     }
                 }
 
+                /* Check shark fins in water gaps (between bays) */
+                bool onSharkFin = false;
+                if (!inBay)
+                {
+                    for (int i = 0; i < SHARK_FIN_COUNT; i++)
+                    {
+                        if (CheckCollisionRecs(frogRect, sharkFins[i].rect))
+                        {
+                            onSharkFin = true;
+                            break;
+                        }
+                    }
+                }
+
                 if (inBay)
                 {
                     if (goalFilled[bayIndex])
@@ -1093,7 +1850,7 @@ int main(void)
                         /* Claim this bay */
                         goalFilled[bayIndex] = true;
                         score += 10;
-                        timeRemaining = 30.0f;
+                        timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                         if (sndGoal.frameCount > 0) PlaySound(sndGoal);
                         reset_frog(&frog);
 
@@ -1115,19 +1872,27 @@ int main(void)
                         }
                     }
                 }
+                else if (onSharkFin)
+                {
+                    /* Shark fin - always dangerous */
+                    lives--;
+                    timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
+                    if (sndSplash.frameCount > 0) PlaySound(sndSplash);
+                    reset_frog(&frog);
+                }
                 else if (inBarrier || frogCenterY < bayTop)
                 {
                     /* Hit barrier or upper decorative area - lose life */
                     lives--;
-                    timeRemaining = 30.0f;
+                    timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                     if (sndSplash.frameCount > 0) PlaySound(sndSplash);
                     reset_frog(&frog);
                 }
-                /* If in goal area but not in bay or barrier (shouldn't happen), treat as barrier */
+                /* If in goal area but not in bay, alligator, or barrier (shouldn't happen), treat as barrier */
                 else
                 {
                     lives--;
-                    timeRemaining = 30.0f;
+                    timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                     if (sndSplash.frameCount > 0) PlaySound(sndSplash);
                     reset_frog(&frog);
                 }
@@ -1147,14 +1912,12 @@ int main(void)
         }
         else if (state == STATE_LEVEL_COMPLETE)
         {
-            levelCompleteTimer -= dt;
-
-            if (levelCompleteTimer <= 0.0f)
+            if (IsKeyPressed(KEY_ENTER))
             {
                 level++;
-                timeRemaining = 30.0f;
+                timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
                 reset_frog(&frog);
-                reset_level(cars, logs, goalFilled, level);
+                reset_level(cars, logs, sharkFins, goalFilled, level);
                 state = STATE_PLAYING;
             }
         }
@@ -1171,6 +1934,8 @@ int main(void)
                     save_high_score(highScore);
                     newHighScoreThisRun = true;
                 }
+
+                add_leaderboard_entry(score);
             }
 
             if (IsKeyPressed(KEY_R))
@@ -1185,14 +1950,26 @@ int main(void)
 
         if (state == STATE_MENU)
         {
-            draw_menu(highScore, startBgTex);
+            draw_menu(highScore, startBgTex, musicMuted);
+        }
+        else if (state == STATE_LEADERBOARD)
+        {
+            draw_leaderboard();
+        }
+        else if (state == STATE_HOW_TO_PLAY)
+        {
+            draw_how_to_play();
+        }
+        else if (state == STATE_CREDITS)
+        {
+            draw_credits();
         }
         else
         {
             ClearBackground(RAYWHITE);
 
             /* scenery, back to front */
-            draw_goal_area(goalFilled, frogTex, level, score);
+            draw_goal_area(goalFilled, sharkFins, frogTex, level, score);
             draw_river(time);
             draw_grass_band(MEDIAN_TOP, MEDIAN_HEIGHT);  /* Grass strip between river and road */
             draw_road();
@@ -1200,10 +1977,22 @@ int main(void)
 
             /* lily pad slots are now drawn inside draw_goal_area() */
 
-            /* logs (under the frog, in the river band) */
+            /* logs (under the frog, in the river band) - indices 2,3,6,7
+               (river rows 1 and 3) are drawn as turtle groups instead of
+               logs, giving 3 log rows + 2 turtle rows, alternating. The
+               underlying rect/speed/collision behaviour is identical to
+               a log either way - only the visual changes. */
             for (int i = 0; i < LOG_COUNT; i++)
             {
-                draw_log(logs[i], logTex);
+                bool isTurtleRow = (i == 2 || i == 3 || i == 6 || i == 7);
+                if (isTurtleRow)
+                {
+                    draw_turtle_group(logs[i].rect, logs[i].speed);
+                }
+                else
+                {
+                    draw_log(logs[i], logTex);
+                }
             }
 
             /* cars (in the road band) */
@@ -1216,7 +2005,7 @@ int main(void)
             draw_frog(frog, frogTex);
 
             /* HUD */
-            draw_hud(lives, timeRemaining);
+            draw_hud(lives, timeRemaining, musicMuted);
 
             if (state == STATE_PAUSED)
             {
@@ -1239,6 +2028,7 @@ int main(void)
     if (carTextureValid) UnloadTexture(carTexture);
     if (carSportsTextureValid) UnloadTexture(carSportsTexture);
     if (carTruckTextureValid) UnloadTexture(carTruckTexture);
+    if (turtleTextureValid) UnloadTexture(turtleTexture);
     UnloadTexture(logTex);
     UnloadTexture(startBgTex);
 
@@ -1248,6 +2038,8 @@ int main(void)
     UnloadSound(sndGoal);
     UnloadSound(sndLevelUp);
     UnloadSound(sndGameOver);
+
+    if (bgMusicValid) UnloadMusicStream(bgMusic);
 
     CloseAudioDevice();
     CloseWindow();
