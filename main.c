@@ -1,39 +1,3 @@
-/*
-    ZISIN FROGGER - bigger edition (v3 - visual & audio polish pass)
-    ------------------------------------------------------------------
-    Changes in this pass, all requested by the player:
-      1. Lives shown as heart icons instead of a plain number.
-      2. River restyled to look more like moving water + a distinct
-         "drowning" sound when the frog falls in.
-      3. Overall colour palette reworked to look more natural.
-      4. Log height increased so the frog's whole body sits on the log
-         (it used to hang half off the bottom edge).
-      5. Road lanes repositioned so cars sit fully on the asphalt,
-         between the lane-divider lines, instead of overlapping the
-         grass or the dashed lines.
-      6. The 5 goal "lily pads" now look like actual lily pads with a
-         little flower, and turn into a planted flag once claimed.
-      7. Grass bands (median strip + bottom strip) now have a mowed-
-         lawn stripe pattern; the goal area uses a completely
-         different checkerboard "finish line" look.
-      8. New/updated sound effects: crash (car hit), drown (river),
-         goal (single lily pad reached), level-up (all 5 pads filled).
-
-    run command (Windows / MSYS2 MINGW64):
-    gcc main.c -o main.exe -Iraylib/raylib-6.0_win64_mingw-w64/include -Lraylib/raylib-6.0_win64_mingw-w64/lib -lraylib -lopengl32 -lgdi32 -lwinmm
-
-    Assets expected next to the executable (same folder as main.c):
-    assets/images/frog.png
-    assets/images/car.png
-    assets/images/log.png
-    assets/sounds/jump.wav
-    assets/sounds/crash.wav
-    assets/sounds/splash.wav
-    assets/sounds/goal.wav
-    assets/sounds/levelup.wav
-    assets/sounds/gameover.wav
-*/
-
 #include "raylib.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,7 +21,12 @@
 
 #define GOAL_SLOT_COUNT 5
 
-#define FROG_NAME "Zisin"
+#define FROG_NAME "Zisin"  /* default name, shown until the player sets their own */
+
+/* The player's chosen name - shown floating above the frog and saved
+   with leaderboard entries. Editable from the main menu ("NAME" button).
+   Starts as FROG_NAME and can be changed any time before playing. */
+char playerName[32] = FROG_NAME;
 
 #define HIGH_SCORE_FILE "highscore.txt"
 
@@ -215,6 +184,7 @@ typedef enum
     STATE_LEADERBOARD,
     STATE_HOW_TO_PLAY,
     STATE_CREDITS,
+    STATE_NAME_ENTRY,
     STATE_PLAYING,
     STATE_PAUSED,
     STATE_LEVEL_COMPLETE,
@@ -342,11 +312,11 @@ void save_leaderboard(LeaderboardEntry entries[LEADERBOARD_MAX], int count)
     }
 }
 
-/* Inserts a new score into the leaderboard (name is always FROG_NAME,
-   since the game doesn't ask for player initials), keeps it sorted
-   highest-to-lowest, and trims it back down to LEADERBOARD_MAX entries.
-   Returns the 1-based rank the new score landed at, or -1 if it didn't
-   make the top LEADERBOARD_MAX. */
+/* Inserts a new score into the leaderboard under the player's current
+   chosen name (playerName - set from the main menu's NAME button),
+   keeps it sorted highest-to-lowest, and trims it back down to
+   LEADERBOARD_MAX entries. Returns the 1-based rank the new score
+   landed at, or -1 if it didn't make the top LEADERBOARD_MAX. */
 int add_leaderboard_entry(int score)
 {
     LeaderboardEntry entries[LEADERBOARD_MAX];
@@ -376,7 +346,7 @@ int add_leaderboard_entry(int score)
         entries[i] = entries[i - 1];
     }
 
-    TextCopy(entries[insertPos].name, FROG_NAME);
+    TextCopy(entries[insertPos].name, playerName);
     entries[insertPos].score = score;
 
     save_leaderboard(entries, newCount);
@@ -441,10 +411,11 @@ void draw_frog(Vector2 frog, Texture2D frogTex)
 
     DrawTexturePro(frogTex, src, dest, origin, 0.0f, WHITE);
 
-    /* Frog er naam, floating just above its head */
+    /* Player's chosen name, floating just above its head, centered */
+    int nameW = MeasureText(playerName, 16);
     DrawText(
-        FROG_NAME,
-        frog.x - 5,
+        playerName,
+        (int)(frog.x + FROG_SIZE / 2 - nameW / 2),
         frog.y - 22,
         16,
         BLACK
@@ -1081,8 +1052,138 @@ void draw_sand_band(int y, int height)
    SECTION: SCREENS / OVERLAYS (menu, pause, level complete, game over, HUD)
    ================================================================ */
 
+/* Clickable button rectangles for the main menu, laid out once here so
+   both the input-handling code (to detect clicks) and draw_menu() (to
+   render them) always agree on exactly where each button is. */
+typedef struct MenuButtons
+{
+    Rectangle start;
+    Rectangle leaderboard;
+    Rectangle howToPlay;
+    Rectangle credits;
+    Rectangle difficulty;
+    Rectangle music;
+} MenuButtons;
+
+MenuButtons compute_menu_buttons(void)
+{
+    MenuButtons b;
+
+    int centerX = SCREEN_WIDTH / 2;
+    int y = 195;
+
+    int startW = 320, startH = 54;
+    b.start = (Rectangle){centerX - startW / 2, y, startW, startH};
+    y += startH + 14;
+
+    int smallW = 260, smallH = 42;
+    b.leaderboard = (Rectangle){centerX - smallW / 2, y, smallW, smallH};
+    y += smallH + 10;
+
+    b.howToPlay = (Rectangle){centerX - smallW / 2, y, smallW, smallH};
+    y += smallH + 10;
+
+    b.credits = (Rectangle){centerX - smallW / 2, y, smallW, smallH};
+    y += smallH + 10;
+
+    b.difficulty = (Rectangle){centerX - smallW / 2, y, smallW, smallH};
+    y += smallH + 10;
+
+    b.music = (Rectangle){centerX - smallW / 2, y, smallW, smallH};
+
+    return b;
+}
+
+/* Draws one menu button: rounded background (lighter when hovered),
+   centered label text. Purely visual - click detection uses the same
+   rectangle separately in the input-handling code via
+   compute_menu_buttons(), so the two always stay in sync. */
+void draw_menu_button(Rectangle rect, const char *label, Color baseColor, Color textColor, int fontSize)
+{
+    Vector2 mouse = GetMousePosition();
+    bool hovered = CheckCollisionPointRec(mouse, rect);
+
+    Color fill = hovered ? Fade(baseColor, 0.9f) : Fade(baseColor, 0.65f);
+    DrawRectangleRounded(rect, 0.25f, 8, fill);
+    DrawRectangleRoundedLines(rect, 0.25f, 8, hovered ? WHITE : Fade(WHITE, 0.4f));
+
+    int textW = MeasureText(label, fontSize);
+    int textX = (int)(rect.x + (rect.width - textW) / 2);
+    int textY = (int)(rect.y + (rect.height - fontSize) / 2);
+    DrawText(label, textX, textY, fontSize, textColor);
+}
+
+/* Shared "Back" button used by the Leaderboard / How-to-Play / Credits
+   overlay screens - same rectangle used for both drawing and click
+   detection, same pattern as the main menu buttons above. */
+Rectangle compute_back_button(void)
+{
+    int w = 220, h = 40;
+    return (Rectangle){SCREEN_WIDTH / 2 - w / 2, SCREEN_HEIGHT - h - 20, w, h};
+}
+
+void draw_back_button(void)
+{
+    draw_menu_button(compute_back_button(), "BACK  (ENTER / ESC)", (Color){40, 70, 130, 255}, RAYWHITE, 18);
+}
+
+/* Name-entry screen's Start/Cancel buttons, laid out side by side. */
+Rectangle compute_name_confirm_button(void)
+{
+    int w = 200, h = 44;
+    return (Rectangle){SCREEN_WIDTH / 2 - w - 10, 330, w, h};
+}
+
+Rectangle compute_name_cancel_button(void)
+{
+    int w = 200, h = 44;
+    return (Rectangle){SCREEN_WIDTH / 2 + 10, 330, w, h};
+}
+
+/* Name-entry screen - lets the player type a custom name before playing.
+   Typed characters build up in nameEditBuffer (owned by main()); this
+   function only draws the current state of that buffer plus a blinking
+   cursor and Start/Cancel buttons. Reached by pressing/clicking Start
+   Game on the main menu; ENTER or clicking Start Game here commits
+   nameEditBuffer to playerName AND begins the actual game. ESC or
+   clicking Back to Menu discards the edit and returns to the menu. */
+void draw_name_entry(const char *nameEditBuffer)
+{
+    DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, (Color){15, 25, 45, 255});
+
+    const char *title = "ENTER YOUR NAME";
+    int titleSize = 34;
+    DrawText(title, SCREEN_WIDTH / 2 - MeasureText(title, titleSize) / 2, 120, titleSize, (Color){140, 220, 255, 255});
+
+    /* Text entry box */
+    int boxW = 360, boxH = 54;
+    int boxX = SCREEN_WIDTH / 2 - boxW / 2;
+    int boxY = 210;
+    DrawRectangleRounded((Rectangle){boxX, boxY, boxW, boxH}, 0.2f, 8, (Color){30, 30, 40, 255});
+    DrawRectangleRoundedLines((Rectangle){boxX, boxY, boxW, boxH}, 0.2f, 8, (Color){140, 220, 255, 255});
+
+    int textSize = 28;
+    int textW = MeasureText(nameEditBuffer, textSize);
+    int textX = boxX + boxW / 2 - textW / 2;
+    int textY = boxY + boxH / 2 - textSize / 2;
+    DrawText(nameEditBuffer, textX, textY, textSize, RAYWHITE);
+
+    /* blinking cursor right after the typed text */
+    if (fmodf((float)GetTime(), 1.0f) < 0.5f)
+    {
+        DrawRectangle(textX + textW + 3, textY, 3, textSize, RAYWHITE);
+    }
+
+    const char *hint = "Letters, numbers and spaces - up to 14 characters";
+    DrawText(hint, SCREEN_WIDTH / 2 - MeasureText(hint, 15) / 2, boxY + boxH + 14, 15, (Color){170, 170, 170, 255});
+
+    draw_menu_button(compute_name_confirm_button(), "START GAME  (ENTER)", (Color){40, 160, 60, 255}, YELLOW, 17);
+    draw_menu_button(compute_name_cancel_button(), "BACK TO MENU  (ESC)", (Color){140, 40, 40, 255}, RAYWHITE, 17);
+}
+
 void draw_menu(int highScore, Texture2D startBgTex, bool musicMuted)
 {
+
     /* Draw the detailed background image (contains title, frog-lives box, flowers, butterflies, lily pads, logs, turtles) */
     DrawTexturePro(
         startBgTex,
@@ -1115,79 +1216,29 @@ void draw_menu(int highScore, Texture2D startBgTex, bool musicMuted)
         DrawText(hiValueStr, bgX + padding + labelW + 10, bgY + padding, fontSize, YELLOW);
     }
 
-    /* "PRESS ENTER TO START" - positioned in open water area between title (upper-third) and turtles row */
+    /* MAIN MENU BUTTONS - clickable (mouse) and still keyboard-shortcut-able;
+       compute_menu_buttons() is the single source of truth for where each
+       button sits, shared with the click-detection code in main(). */
     {
-        const char *startText = "PRESS ENTER TO START";
-        int startSize = 32;
-        int startW = MeasureText(startText, startSize);
-        int startPadding = 12;
-        int startBgW = startW + startPadding * 2;
-        int startBgH = startSize + startPadding * 2;
-        int startBgX = (SCREEN_WIDTH - startBgW) / 2;
-        int startBgY = 200;  /* below title area, above center frog-on-log illustration */
+        MenuButtons btn = compute_menu_buttons();
 
-        /* Pulsing alpha */
-        float pulseAlpha = 0.4f + 0.6f * (sinf(GetTime() * 4.2f) * 0.5f + 0.5f);
+        /* Pulsing highlight for the primary Start button so it still draws the eye */
+        float pulse = 0.75f + 0.25f * (sinf(GetTime() * 4.2f) * 0.5f + 0.5f);
+        draw_menu_button(btn.start, "START GAME  (ENTER)", Fade((Color){40, 160, 60, 255}, pulse), YELLOW, 26);
 
-        /* Semi-transparent dark rounded backing */
-        DrawRectangleRounded((Rectangle){startBgX, startBgY, startBgW, startBgH}, 6, 8, Fade(BLACK, 0.5f));
+        draw_menu_button(btn.leaderboard, "LEADERBOARD  (L)", (Color){40, 70, 130, 255}, RAYWHITE, 19);
+        draw_menu_button(btn.howToPlay, "HOW TO PLAY  (H)", (Color){40, 70, 130, 255}, RAYWHITE, 19);
+        draw_menu_button(btn.credits, "CREDITS  (C)", (Color){40, 70, 130, 255}, RAYWHITE, 19);
 
-        /* Text */
-        DrawText(startText, startBgX + startPadding, startBgY + startPadding, startSize, Fade(YELLOW, pulseAlpha));
-    }
-
-    /* DIFFICULTY SELECTOR - just below the start prompt, cycled with LEFT/RIGHT (or A/D) */
-    {
-        const char *diffText = TextFormat("< DIFFICULTY: %s >", difficulty_name(currentDifficulty));
-        int diffSize = 22;
-        int diffW = MeasureText(diffText, diffSize);
-        int diffPadding = 10;
-        int diffBgW = diffW + diffPadding * 2;
-        int diffBgH = diffSize + diffPadding * 2;
-        int diffBgX = (SCREEN_WIDTH - diffBgW) / 2;
-        int diffBgY = 200 + 32 + 24 + 12;  /* just under the start-prompt box */
-
+        const char *diffText = TextFormat("DIFFICULTY: %s  (< / >)", difficulty_name(currentDifficulty));
         Color diffColor = (currentDifficulty == DIFF_EASY) ? (Color){120, 220, 120, 255}
                          : (currentDifficulty == DIFF_HARD) ? (Color){230, 90, 90, 255}
                          : (Color){255, 210, 90, 255};
+        draw_menu_button(btn.difficulty, diffText, (Color){90, 60, 120, 255}, diffColor, 18);
 
-        DrawRectangleRounded((Rectangle){diffBgX, diffBgY, diffBgW, diffBgH}, 6, 8, Fade(BLACK, 0.5f));
-        DrawText(diffText, diffBgX + diffPadding, diffBgY + diffPadding, diffSize, diffColor);
-    }
-
-    /* MUSIC MUTE INDICATOR - just below the difficulty selector */
-    {
-        const char *musicText = musicMuted ? "MUSIC: OFF (M to unmute)" : "MUSIC: ON (M to mute)";
-        int musicSize = 18;
-        int musicW = MeasureText(musicText, musicSize);
-        int musicPadding = 8;
-        int musicBgW = musicW + musicPadding * 2;
-        int musicBgH = musicSize + musicPadding * 2;
-        int musicBgX = (SCREEN_WIDTH - musicBgW) / 2;
-        int musicBgY = 200 + 32 + 24 + 12 + (22 + 20) + 8;  /* just under the difficulty box */
-
-        Color musicColor = musicMuted ? (Color){160, 160, 160, 255} : (Color){140, 220, 255, 255};
-
-        DrawRectangleRounded((Rectangle){musicBgX, musicBgY, musicBgW, musicBgH}, 6, 8, Fade(BLACK, 0.5f));
-        DrawText(musicText, musicBgX + musicPadding, musicBgY + musicPadding, musicSize, musicColor);
-    }
-
-    /* CONTROLS text - at very bottom in stone/sand border strip */
-    {
-        const char *controls = "P=Pause  L=Leaderboard  H=How to Play  C=Credits  </>=Difficulty  M=Mute";
-        int ctrlSize = 16;
-        int ctrlW = MeasureText(controls, ctrlSize);
-        int ctrlPadding = 10;
-        int ctrlBgW = ctrlW + ctrlPadding * 2;
-        int ctrlBgH = ctrlSize + ctrlPadding * 2;
-        int ctrlBgX = (SCREEN_WIDTH - ctrlBgW) / 2;
-        int ctrlBgY = SCREEN_HEIGHT - ctrlBgH - 10;
-
-        /* Semi-transparent dark rounded backing */
-        DrawRectangleRounded((Rectangle){ctrlBgX, ctrlBgY, ctrlBgW, ctrlBgH}, 6, 8, Fade(BLACK, 0.5f));
-
-        /* Text */
-        DrawText(controls, ctrlBgX + ctrlPadding, ctrlBgY + ctrlPadding, ctrlSize, Fade(YELLOW, 0.9f));
+        const char *musicText = musicMuted ? "MUSIC: OFF  (M)" : "MUSIC: ON  (M)";
+        Color musicColor = musicMuted ? (Color){170, 170, 170, 255} : (Color){140, 220, 255, 255};
+        draw_menu_button(btn.music, musicText, (Color){90, 60, 120, 255}, musicColor, 18);
     }
 }
 
@@ -1233,8 +1284,7 @@ void draw_leaderboard(void)
         }
     }
 
-    const char *backHint = "Press ENTER or ESC to go back";
-    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 50, 18, (Color){255, 230, 120, 255});
+    draw_back_button();
 }
 
 /* How-to-play screen - explains controls and rules. Reached from the
@@ -1253,26 +1303,21 @@ void draw_how_to_play(void)
     int x = 60;
 
     const char *lines[] = {
-        "GOAL: Guide your frog safely into all 5 empty goal slots",
+        "GOAL: ",
+        "Guide your frog safely into all 5 empty goal slots.",
         "at the top of the screen to clear the level.",
         "",
         "CONTROLS:",
         "  Arrow Keys or WASD  -  Hop up / down / left / right",
         "  P                   -  Pause the game",
         "",
-        "OBSTACLES:",
-        "  Cars & trucks (road)     - touching one costs a life",
-        "  Water (river)            - falling in costs a life,",
-        "                             unless you're on a log or turtle",
-        "  Logs & turtles           - safe rides across the river,",
-        "                             float with the current",
-        "  Crabs & other hazards    - avoid these near the goal slots",
-        "",
-        "TIMER: Each attempt has a countdown shown top-right and as",
+        "TIMER: ",
+        "Each attempt has a countdown shown top-right and as",
         "a bar in the goal row - reach a goal before it runs out!",
         "",
-        "LIVES & SCORING: You start with a set number of lives",
-        "(fewer on Hard, more on Easy). Reaching a goal scores points;",
+        "LIVES & SCORING: ",
+        "You start with a set number of lives",
+        "(fewer on Hard, more on Easy). Reaching a goal scores points.",
         "running out of lives ends the game."
     };
     int lineCount = sizeof(lines) / sizeof(lines[0]);
@@ -1280,15 +1325,17 @@ void draw_how_to_play(void)
     for (int i = 0; i < lineCount; i++)
     {
         Color lineColor = RAYWHITE;
-        if (TextIsEqual(lines[i], "CONTROLS:") || TextIsEqual(lines[i], "OBSTACLES:"))
+        if (TextIsEqual(lines[i], "CONTROLS:") || TextIsEqual(lines[i], "OBSTACLES:") ||
+            strncmp(lines[i], "GOAL:", 5) == 0 ||
+            strncmp(lines[i], "TIMER:", 6) == 0 ||
+            strncmp(lines[i], "LIVES & SCORING:", 16) == 0)
         {
             lineColor = (Color){255, 210, 90, 255};
         }
         DrawText(lines[i], x, y + i * lineHeight, fontSize, lineColor);
     }
 
-    const char *backHint = "Press ENTER or ESC to go back";
-    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 40, 18, (Color){255, 230, 120, 255});
+    draw_back_button();
 }
 
 /* Credits screen - attribution for external resources used in the
@@ -1311,18 +1358,14 @@ void draw_credits(void)
        downloaded (background art, car/turtle sprites, sound effects). */
     const char *lines[] = {
         "GAME DESIGN & PROGRAMMING",
-        "  Zisin",
-        "",
-        "BACKGROUND ART",
-        "  Start-screen river background - [source / author / license]",
+        " Md. Zihan Ahammed & MAshfia Bint Matin",
         "",
         "SPRITES",
-        "  Vehicle sprites (car, sports car, truck) - [source / author / license]",
-        "  Turtle sprite - original artwork made for this project",
+        "  Vehicle sprites (car, sports car, truck) - generated programmatically with Python",
         "",
         "SOUND EFFECTS",
-        "  Jump, crash, splash, goal, level up, game over -",
-        "  [source / author / license, e.g. freesound.org / Kenney.nl]",
+        "  Jump, crash, splash, goal, level up, game over - freesound.org / Kenney.nl",
+        "  Background Music - Three Initials Left (from album Infinite Credits)",
         "",
         "BUILT WITH",
         "  raylib (https://www.raylib.com)",
@@ -1343,8 +1386,7 @@ void draw_credits(void)
         DrawText(lines[i], x, y + i * lineHeight, fontSize, lineColor);
     }
 
-    const char *backHint = "Press ENTER or ESC to go back";
-    DrawText(backHint, SCREEN_WIDTH / 2 - MeasureText(backHint, 18) / 2, SCREEN_HEIGHT - 40, 18, (Color){255, 230, 120, 255});
+    draw_back_button();
 }
 
 void draw_pause_overlay(void)
@@ -1503,20 +1545,23 @@ int main(void)
         TraceLog(LOG_WARNING, "Some sound assets failed to load (continuing without sound)");
     }
 
-    /* Background music - streamed from disk with automatic looping.
-       Music streams handle continuous playback and looping natively. */
-    Music bgMusic = LoadMusicStream("assets/sounds/bgm.wav");
-    bool bgMusicValid = IsMusicValid(bgMusic);
+    /* Background music - loaded fully into memory (not streamed from disk)
+       so a slow/stalled disk read (antivirus scan, cloud-sync placeholder
+       file, etc.) can never freeze the running game the way a Music
+       stream's per-frame disk reads could. Looped manually by restarting
+       it whenever it finishes. */
+    Sound bgMusic = LoadSound("assets/sounds/bgm.WAV");
+    bool bgMusicValid = (bgMusic.frameCount > 0);
     bool musicMuted = false;
 
     if (bgMusicValid)
     {
-        SetMusicVolume(bgMusic, 0.5f);
-        PlayMusicStream(bgMusic);
+        SetSoundVolume(bgMusic, 0.5f);
+        PlaySound(bgMusic);
     }
     else
     {
-        TraceLog(LOG_WARNING, "Failed to load assets/sounds/bgm.wav, continuing without music");
+        TraceLog(LOG_WARNING, "Failed to load assets/sounds/bgm.WAV, continuing without music");
     }
 
     /* nicer, more natural-looking per-lane car colours */
@@ -1536,6 +1581,9 @@ int main(void)
     /* ------------- game state ------------- */
 
     GameState state = STATE_MENU;
+
+    char nameEditBuffer[32];
+    TextCopy(nameEditBuffer, playerName);
 
     int highScore = load_high_score();
     bool newHighScoreThisRun = false;
@@ -1565,14 +1613,12 @@ int main(void)
 
         /* ------------- music (plays/loops regardless of screen) ------------- */
 
-        if (bgMusicValid)
+        if (bgMusicValid && !musicMuted && !IsSoundPlaying(bgMusic))
         {
-            UpdateMusicStream(bgMusic);
-        }
-
-        if (bgMusicValid && !musicMuted && !IsMusicStreamPlaying(bgMusic))
-        {
-            PlayMusicStream(bgMusic);
+            /* fully-loaded Sound has no per-frame disk I/O, so this is a
+               cheap check - just replay it the instant it finishes, giving
+               a manual loop with no streaming stalls possible. */
+            PlaySound(bgMusic);
         }
 
         if (IsKeyPressed(KEY_M))
@@ -1582,11 +1628,11 @@ int main(void)
             {
                 if (musicMuted)
                 {
-                    PauseMusicStream(bgMusic);
+                    StopSound(bgMusic);
                 }
                 else
                 {
-                    ResumeMusicStream(bgMusic);
+                    PlaySound(bgMusic);
                 }
             }
         }
@@ -1595,27 +1641,35 @@ int main(void)
 
         if (state == STATE_MENU)
         {
-            if (IsKeyPressed(KEY_ENTER))
+            Vector2 mousePos = GetMousePosition();
+            bool mouseClicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+            MenuButtons menuBtn = compute_menu_buttons();
+
+            bool clickStart       = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.start);
+            bool clickLeaderboard = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.leaderboard);
+            bool clickHowToPlay   = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.howToPlay);
+            bool clickCredits     = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.credits);
+            bool clickDifficulty  = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.difficulty);
+            bool clickMusic       = mouseClicked && CheckCollisionPointRec(mousePos, menuBtn.music);
+
+            if (IsKeyPressed(KEY_ENTER) || clickStart)
             {
-                score = 0;
-                lives = g_startingLives;
-                level = 1;
-                timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
-                newHighScoreThisRun = false;
-                gameOverSoundPlayed = false;
-                reset_frog(&frog);
-                reset_level(cars, logs, sharkFins, goalFilled, level);
-                state = STATE_PLAYING;
+                /* Start Game no longer jumps straight into play - it first
+                   asks for the player's name, pre-filled with whatever
+                   name is currently set. The actual game-start logic now
+                   lives in the STATE_NAME_ENTRY confirm handler below. */
+                TextCopy(nameEditBuffer, playerName);
+                state = STATE_NAME_ENTRY;
             }
-            else if (IsKeyPressed(KEY_L))
+            else if (IsKeyPressed(KEY_L) || clickLeaderboard)
             {
                 state = STATE_LEADERBOARD;
             }
-            else if (IsKeyPressed(KEY_H))
+            else if (IsKeyPressed(KEY_H) || clickHowToPlay)
             {
                 state = STATE_HOW_TO_PLAY;
             }
-            else if (IsKeyPressed(KEY_C))
+            else if (IsKeyPressed(KEY_C) || clickCredits)
             {
                 state = STATE_CREDITS;
             }
@@ -1626,31 +1680,119 @@ int main(void)
                 else currentDifficulty = DIFF_MEDIUM;
                 apply_difficulty(currentDifficulty);
             }
-            else if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D))
+            else if (IsKeyPressed(KEY_RIGHT) || IsKeyPressed(KEY_D) || clickDifficulty)
             {
+                /* clicking the difficulty button cycles forward, same as RIGHT/D */
                 if (currentDifficulty == DIFF_EASY) currentDifficulty = DIFF_MEDIUM;
                 else if (currentDifficulty == DIFF_MEDIUM) currentDifficulty = DIFF_HARD;
                 else currentDifficulty = DIFF_EASY;
                 apply_difficulty(currentDifficulty);
             }
+            else if (clickMusic)
+            {
+                /* same toggle as pressing M */
+                musicMuted = !musicMuted;
+                if (bgMusicValid)
+                {
+                    if (musicMuted) StopSound(bgMusic);
+                    else PlaySound(bgMusic);
+                }
+            }
+        }
+        else if (state == STATE_NAME_ENTRY)
+        {
+            /* Capture typed characters - letters, numbers, spaces only,
+               capped at 14 visible characters so it fits neatly above the
+               frog and in the leaderboard columns. */
+            int ch = GetCharPressed();
+            while (ch > 0)
+            {
+                bool allowed = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                               (ch >= '0' && ch <= '9') || (ch == ' ');
+                int len = TextLength(nameEditBuffer);
+                if (allowed && len < 14)
+                {
+                    nameEditBuffer[len] = (char)ch;
+                    nameEditBuffer[len + 1] = '\0';
+                }
+                ch = GetCharPressed();
+            }
+
+            if (IsKeyPressed(KEY_BACKSPACE))
+            {
+                int len = TextLength(nameEditBuffer);
+                if (len > 0)
+                {
+                    nameEditBuffer[len - 1] = '\0';
+                }
+            }
+
+            bool mouseClicked = IsMouseButtonPressed(MOUSE_LEFT_BUTTON);
+            Vector2 mousePos = GetMousePosition();
+            bool clickConfirm = mouseClicked && CheckCollisionPointRec(mousePos, compute_name_confirm_button());
+            bool clickCancel  = mouseClicked && CheckCollisionPointRec(mousePos, compute_name_cancel_button());
+
+            if (IsKeyPressed(KEY_ENTER) || clickConfirm)
+            {
+                /* trim leading/trailing spaces; keep the old name if the
+                   result is empty so the player can never end up with a
+                   blank name */
+                int start = 0;
+                while (nameEditBuffer[start] == ' ') start++;
+                int end = TextLength(nameEditBuffer) - 1;
+                while (end >= start && nameEditBuffer[end] == ' ') end--;
+
+                if (end >= start)
+                {
+                    int trimmedLen = end - start + 1;
+                    for (int i = 0; i < trimmedLen; i++)
+                    {
+                        playerName[i] = nameEditBuffer[start + i];
+                    }
+                    playerName[trimmedLen] = '\0';
+                }
+
+                /* name is set - now actually start the game */
+                score = 0;
+                lives = g_startingLives;
+                level = 1;
+                timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
+                newHighScoreThisRun = false;
+                gameOverSoundPlayed = false;
+                reset_frog(&frog);
+                reset_level(cars, logs, sharkFins, goalFilled, level);
+                state = STATE_PLAYING;
+            }
+            else if (IsKeyPressed(KEY_ESCAPE) || clickCancel)
+            {
+                /* discard edits, keep whatever playerName already was, and
+                   go back to the menu (not into the game) */
+                state = STATE_MENU;
+            }
         }
         else if (state == STATE_LEADERBOARD)
         {
-            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            bool clickBack = IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+                              CheckCollisionPointRec(GetMousePosition(), compute_back_button());
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE) || clickBack)
             {
                 state = STATE_MENU;
             }
         }
         else if (state == STATE_HOW_TO_PLAY)
         {
-            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            bool clickBack = IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+                              CheckCollisionPointRec(GetMousePosition(), compute_back_button());
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE) || clickBack)
             {
                 state = STATE_MENU;
             }
         }
         else if (state == STATE_CREDITS)
         {
-            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
+            bool clickBack = IsMouseButtonPressed(MOUSE_LEFT_BUTTON) &&
+                              CheckCollisionPointRec(GetMousePosition(), compute_back_button());
+            if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE) || clickBack)
             {
                 state = STATE_MENU;
             }
@@ -1964,6 +2106,10 @@ int main(void)
         {
             draw_credits();
         }
+        else if (state == STATE_NAME_ENTRY)
+        {
+            draw_name_entry(nameEditBuffer);
+        }
         else
         {
             ClearBackground(RAYWHITE);
@@ -2039,7 +2185,7 @@ int main(void)
     UnloadSound(sndLevelUp);
     UnloadSound(sndGameOver);
 
-    if (bgMusicValid) UnloadMusicStream(bgMusic);
+    if (bgMusicValid) UnloadSound(bgMusic);
 
     CloseAudioDevice();
     CloseWindow();
