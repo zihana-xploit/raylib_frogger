@@ -43,7 +43,7 @@ char playerName[32] = FROG_NAME;
 #define BASE_TIMER_SCALE 0.1f             /* timer reduction per level */
 #define BASE_TIMER_MIN_MULT 0.1f          /* min timer multiplier (never below 50%) */
 #define BASE_TIMER_DURATION 30.0f         /* seconds on the goal-row timer at level 1 */
-#define BASE_STARTING_LIVES 5
+#define BASE_STARTING_LIVES 3
 
 
 /* ================================================================
