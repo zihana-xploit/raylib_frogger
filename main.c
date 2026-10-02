@@ -31,7 +31,7 @@ char playerName[32] = FROG_NAME;
 #define HIGH_SCORE_FILE "highscore.txt"
 
 /* how much faster obstacles get, per level - BASE values for MEDIUM
-   difficulty; actual values used at runtime are the g_* variables
+   difficulty; actual values used at runtime are the variables
    below, which apply_difficulty() adjusts per difficulty mode. */
 #define BASE_DIFFICULTY_STEP 0.12f  /* vehicle speed increase per level */
 
@@ -41,9 +41,9 @@ char playerName[32] = FROG_NAME;
 #define BASE_LOG_SPACING_SCALE 0.1f       /* log gap increase per level */
 #define BASE_LOG_MAX_GAP 2.5f             /* max log gap multiplier */
 #define BASE_TIMER_SCALE 0.1f             /* timer reduction per level */
-#define BASE_TIMER_MIN_MULT 0.5f          /* min timer multiplier (never below 50%) */
+#define BASE_TIMER_MIN_MULT 0.1f          /* min timer multiplier (never below 50%) */
 #define BASE_TIMER_DURATION 30.0f         /* seconds on the goal-row timer at level 1 */
-#define BASE_STARTING_LIVES 3
+#define BASE_STARTING_LIVES 5
 
 
 /* ================================================================
@@ -86,7 +86,7 @@ void apply_difficulty(Difficulty d)
             g_logSpacingScale     = BASE_LOG_SPACING_SCALE * 0.6f;
             g_logMaxGap           = 2.0f;
             g_timerScale          = BASE_TIMER_SCALE * 0.6f;
-            g_timerMinMult        = 0.7f;
+            g_timerMinMult        = 0.1f;
             g_baseTimerDuration   = 35.0f;                          /* more time per level */
             g_startingLives       = 4;                              /* one extra life */
             break;
@@ -98,7 +98,7 @@ void apply_difficulty(Difficulty d)
             g_logSpacingScale     = BASE_LOG_SPACING_SCALE * 1.4f;
             g_logMaxGap           = 3.2f;
             g_timerScale          = BASE_TIMER_SCALE * 1.4f;
-            g_timerMinMult        = 0.35f;
+            g_timerMinMult        = 0.1f;
             g_baseTimerDuration   = 25.0f;                          /* less time per level */
             g_startingLives       = 2;                              /* one fewer life */
             break;
@@ -1181,9 +1181,8 @@ void draw_name_entry(const char *nameEditBuffer)
     draw_menu_button(compute_name_cancel_button(), "BACK TO MENU  (ESC)", (Color){140, 40, 40, 255}, RAYWHITE, 17);
 }
 
-void draw_menu(int highScore, Texture2D startBgTex, bool musicMuted)
+void draw_menu(Texture2D startBgTex, bool musicMuted)
 {
-
     /* Draw the detailed background image (contains title, frog-lives box, flowers, butterflies, lily pads, logs, turtles) */
     DrawTexturePro(
         startBgTex,
@@ -1193,28 +1192,6 @@ void draw_menu(int highScore, Texture2D startBgTex, bool musicMuted)
         0.0f,
         WHITE
     );
-
-    /* HIGH SCORE display - moved to bottom strip in plain stone/sand border area */
-    {
-        const char *hiLabel = "HIGH SCORE:";
-        const char *hiValueStr = TextFormat("%d", highScore);
-        int fontSize = 20;
-        int labelW = MeasureText(hiLabel, fontSize);
-        int valueW = MeasureText(hiValueStr, fontSize);
-        int textW = labelW + 10 + valueW;
-        int padding = 10;
-        int bgW = textW + padding * 2;
-        int bgH = fontSize + padding * 2;
-        int bgX = SCREEN_WIDTH - bgW - 20;
-        int bgY = SCREEN_HEIGHT - bgH - 20;
-
-        /* Semi-transparent dark rounded rectangle backing for legibility */
-        DrawRectangleRounded((Rectangle){bgX, bgY, bgW, bgH}, 6, 8, Fade(BLACK, 0.5f));
-
-        /* Text on top in yellow */
-        DrawText(hiLabel, bgX + padding, bgY + padding, fontSize, YELLOW);
-        DrawText(hiValueStr, bgX + padding + labelW + 10, bgY + padding, fontSize, YELLOW);
-    }
 
     /* MAIN MENU BUTTONS - clickable (mouse) and still keyboard-shortcut-able;
        compute_menu_buttons() is the single source of truth for where each
@@ -1407,7 +1384,7 @@ void draw_level_complete_overlay(int level)
     DrawText(next, SCREEN_WIDTH / 2 - MeasureText(next, 22) / 2, SCREEN_HEIGHT / 2 + 30, 22, (Color){255, 230, 120, 255});
 }
 
-void draw_game_over_overlay(int score, int highScore, bool isNewHighScore)
+void draw_game_over_overlay(int score)
 {
     DrawRectangle(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, Fade(BLACK, 0.7f));
 
@@ -1416,14 +1393,6 @@ void draw_game_over_overlay(int score, int highScore, bool isNewHighScore)
 
     const char *finalScoreText = TextFormat("Final Score: %d", score);
     DrawText(finalScoreText, GetScreenWidth() / 2 - MeasureText(finalScoreText, 25) / 2, 280, 25, (Color){255, 230, 120, 255});
-
-    const char *highScoreText = TextFormat("High Score: %d", highScore);
-    DrawText(highScoreText, GetScreenWidth() / 2 - MeasureText(highScoreText, 25) / 2, 315, 25, (Color){255, 220, 60, 255});
-
-    if (isNewHighScore)
-    {
-        DrawText("NEW HIGH SCORE!", GetScreenWidth() / 2 - MeasureText("NEW HIGH SCORE!", 22) / 2, 350, 22, (Color){255, 200, 0, 255});
-    }
 
     const char *restartText = "Press R to Restart";
     DrawText(restartText, GetScreenWidth() / 2 - MeasureText(restartText, 25) / 2, 400, 25, (Color){255, 230, 120, 255});
@@ -1584,9 +1553,6 @@ int main(void)
 
     char nameEditBuffer[32];
     TextCopy(nameEditBuffer, playerName);
-
-    int highScore = load_high_score();
-    bool newHighScoreThisRun = false;
 
     Vector2 frog;
     reset_frog(&frog);
@@ -1757,7 +1723,6 @@ int main(void)
                 lives = g_startingLives;
                 level = 1;
                 timeRemaining = g_baseTimerDuration * compute_timer_mult(level);
-                newHighScoreThisRun = false;
                 gameOverSoundPlayed = false;
                 reset_frog(&frog);
                 reset_level(cars, logs, sharkFins, goalFilled, level);
@@ -2070,13 +2035,6 @@ int main(void)
                 if (sndGameOver.frameCount > 0) PlaySound(sndGameOver);
                 gameOverSoundPlayed = true;
 
-                if (score > highScore)
-                {
-                    highScore = score;
-                    save_high_score(highScore);
-                    newHighScoreThisRun = true;
-                }
-
                 add_leaderboard_entry(score);
             }
 
@@ -2092,7 +2050,7 @@ int main(void)
 
         if (state == STATE_MENU)
         {
-            draw_menu(highScore, startBgTex, musicMuted);
+            draw_menu(startBgTex, musicMuted);
         }
         else if (state == STATE_LEADERBOARD)
         {
@@ -2163,7 +2121,7 @@ int main(void)
             }
             else if (state == STATE_GAME_OVER)
             {
-                draw_game_over_overlay(score, highScore, newHighScoreThisRun);
+                draw_game_over_overlay(score);
             }
         }
 

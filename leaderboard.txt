@@ -1,6 +1,7 @@
 Zisin 50
 Zisin 40
 Zisin 30
+Zisin 30
 Zisin 10
 Zisin 10
 Zisin 0
